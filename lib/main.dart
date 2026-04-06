@@ -1,185 +1,321 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-import 'dart:convert';
+import 'package:path/path.dart' as p;
+import 'dart:io'; 
+import 'package:sqflite_common_ffi/sqflite_ffi.dart'; 
+import 'package:flutter/gestures.dart'; 
+import 'package:image_picker/image_picker.dart'; 
+// ★修正：最新のスクリーンショット防止ライブラリ
+import 'package:secure_application/secure_application.dart';
 
 void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  if (Platform.isWindows || Platform.isLinux) {
+    sqfliteFfiInit();
+    databaseFactory = databaseFactoryFfi;
+  }     
   runApp(const MyApp());
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+// --- 1. データモデル ---
+class Post {
+  final int? id;
+  final String content;
+  final String time;
+  final int likeCount;
+  final bool isLiked;
+  final String? imagePath; 
+
+  Post({
+    this.id, 
+    required this.content, 
+    required this.time, 
+    this.likeCount = 0, 
+    this.isLiked = false,
+    this.imagePath,
+  });
+
+  Map<String, dynamic> toMap() {
+    return {
+      'id': id, 
+      'content': content, 
+      'time': time, 
+      'likeCount': likeCount, 
+      'isLiked': isLiked ? 1 : 0,
+      'imagePath': imagePath,
+    };
+  }
+
+  factory Post.fromMap(Map<String, dynamic> map) {
+    return Post(
+      id: map['id'],
+      content: map['content'],
+      time: map['time'],
+      likeCount: map['likeCount'],
+      isLiked: map['isLiked'] == 1,
+      imagePath: map['imagePath'],
+    );
+  }
+}
+
+// --- 2. データベース管理 ---
+class DatabaseHelper {
+  static final DatabaseHelper _instance = DatabaseHelper._internal();
+  factory DatabaseHelper() => _instance;
+  DatabaseHelper._internal();
+  Database? _database;
+
+  Future<Database> get database async {
+    if (_database != null) return _database!;
+    _database = await _initDatabase();
+    return _database!;
+  }
+
+  Future<Database> _initDatabase() async {
+    String databasesPath = await getDatabasesPath();
+    String path = p.join(databasesPath, 'sns_ver4.db'); 
+    return await openDatabase(
+      path, 
+      version: 2, 
+      onCreate: (db, version) {
+        return db.execute(
+          'CREATE TABLE posts(id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT, time TEXT, likeCount INTEGER, isLiked INTEGER, imagePath TEXT)'
+        );
+      },
+      onUpgrade: (db, oldVersion, newVersion) {
+        if (oldVersion < 2) {
+          db.execute('ALTER TABLE posts ADD COLUMN imagePath TEXT');
+        }
+      }
+    );
+  }
+
+  Future<void> insertPost(Post post) async {
+    final db = await database;
+    await db.insert('posts', post.toMap());
+  }
+
+  Future<void> updatePost(Post post) async {
+    final db = await database;
+    await db.update('posts', post.toMap(), where: 'id = ?', whereArgs: [post.id]);
+  }
+
+  Future<void> deletePost(int id) async {
+    final db = await database;
+    await db.delete('posts', where: 'id = ?', whereArgs: [id]);
+  }
+
+  Future<List<Post>> getPosts() async {
+    final db = await database;
+    final List<Map<String, dynamic>> maps = await db.query('posts', orderBy: 'id DESC');
+    return List.generate(maps.length, (i) => Post.fromMap(maps[i]));
+  }
+}
+
+// --- 3. 検索画面ロジック ---
+class PostSearchDelegate extends SearchDelegate {
+  final List<Post> allPosts;
+  final Widget Function(String) buildRichText; 
+  PostSearchDelegate(this.allPosts, this.buildRichText);
+
+  @override
+  List<Widget>? buildActions(BuildContext context) => [
+    IconButton(icon: const Icon(Icons.clear), onPressed: () => query = '')
+  ];
+  @override
+  Widget? buildLeading(BuildContext context) => IconButton(
+    icon: const Icon(Icons.arrow_back), onPressed: () => close(context, null)
+  );
+  @override
+  Widget buildResults(BuildContext context) => buildSuggestions(context);
+  @override
+  Widget buildSuggestions(BuildContext context) {
+    final suggestions = query.isEmpty 
+        ? allPosts 
+        : allPosts.where((post) => post.content.contains(query)).toList();
+    return Container(
+      color: const Color(0xFF15202B),
+      child: ListView.builder(
+        itemCount: suggestions.length,
+        itemBuilder: (context, index) => ListTile(
+          title: buildRichText(suggestions[index].content),
+          subtitle: Text(suggestions[index].time, style: const TextStyle(color: Colors.grey)),
+        ),
+      ),
+    );
+  }
+}
+
+// 画像拡大画面
+class ImageDetailPage extends StatelessWidget {
+  final String imagePath;
+  final String tag;
+
+  const ImageDetailPage({super.key, required this.imagePath, required this.tag});
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: '自分専用SNS',
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        brightness: Brightness.dark,
-        primaryColor: Colors.blue,
-        scaffoldBackgroundColor: const Color(0xFF15202B),
-        useMaterial3: true,
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(backgroundColor: Colors.black, elevation: 0),
+      body: Center(
+        child: GestureDetector(
+          onTap: () => Navigator.pop(context),
+          child: Hero(
+            tag: tag,
+            child: InteractiveViewer(
+              panEnabled: true,
+              minScale: 0.5,
+              maxScale: 4.0,
+              child: Image.file(File(imagePath), fit: BoxFit.contain),
+            ),
+          ),
+        ),
       ),
-      home: const MyHomePage(title: 'タイムライン'),
+    );
+  }
+}
+
+// --- 4. UI ---
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+  @override
+  Widget build(BuildContext context) {
+    // ★修正：アプリ全体を SecureApplication で包む
+    return SecureApplication(
+      nativeRemoveDelay: 100,
+      child: Builder(builder: (context) {
+        return MaterialApp(
+          debugShowCheckedModeBanner: false,
+          theme: ThemeData(
+            brightness: Brightness.dark, 
+            primaryColor: Colors.blue, 
+            scaffoldBackgroundColor: const Color(0xFF15202B), 
+            useMaterial3: true
+          ),
+          home: const MyHomePage(),
+        );
+      }),
     );
   }
 }
 
 class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-  final String title;
-
+  const MyHomePage({super.key});
   @override
   State<MyHomePage> createState() => _MyHomePageState();
 }
 
 class _MyHomePageState extends State<MyHomePage> {
   final TextEditingController _controller = TextEditingController();
-  final TextEditingController _nameController = TextEditingController();
-  
-  List<Map<String, dynamic>> posts = [];
-  String userName = '自分';
+  final ImagePicker _picker = ImagePicker();
+  List<Post> posts = [];
+  String? _selectedImagePath; 
 
   @override
-  void initState() {
-    super.initState();
-    _loadData();
-  }
-
-  Future<void> _loadData() async {
-    final prefs = await SharedPreferences.getInstance();
-    final String? postData = prefs.getString('my_posts');
-    final String? savedName = prefs.getString('user_name');
-    
-    setState(() {
-      if (postData != null) {
-        posts = List<Map<String, dynamic>>.from(json.decode(postData));
-      }
-      if (savedName != null) {
-        userName = savedName;
-      }
+  void initState() { 
+    super.initState(); 
+    _refreshPosts();
+    // ★こだわり：起動直後にセキュリティ機能をONにする
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _setSecureMode(true);
     });
   }
 
-  Future<void> _saveData() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('my_posts', json.encode(posts));
-    await prefs.setString('user_name', userName);
+
+  void _setSecureMode(bool enable) {
+    final secureContext = SecureApplicationProvider.of(context, listen: false);
+    if (secureContext == null) return; // 安全策としてnullチェック
+
+    if (enable) {
+      // 画面を保護する（スクリーンショット禁止）
+      secureContext.secure(); 
+    } else {
+      // 画面の保護を解除する
+      secureContext.open(); // ← ここを 'unsecure' から 'open' に変更
+    }
   }
 
-  // ★テキストを解析して、ハッシュタグだけ青くするウィジェットを作る
+  void _refreshPosts() async {
+    final data = await DatabaseHelper().getPosts();
+    setState(() => posts = data);
+  }
+
+  Future<void> _pickImage() async {
+    final XFile? image = await _picker.pickImage(source: ImageSource.gallery);
+    if (image != null) {
+      setState(() => _selectedImagePath = image.path);
+    }
+  }
+
+  Future<bool?> _showDeleteDialog(BuildContext context) async {
+    return showDialog<bool>(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF15202B),
+          title: const Text('投稿の削除', style: TextStyle(fontWeight: FontWeight.bold)),
+          content: const Text('この投稿を削除してもよろしいですか？'),
+          actions: <Widget>[
+            TextButton(
+              child: const Text('キャンセル', style: TextStyle(color: Colors.grey)),
+              onPressed: () => Navigator.of(context).pop(false),
+            ),
+            TextButton(
+              child: const Text('削除', style: TextStyle(color: Colors.redAccent)),
+              onPressed: () => Navigator.of(context).pop(true),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _toggleLike(Post post) async {
+    final newPost = Post(
+      id: post.id,
+      content: post.content,
+      time: post.time,
+      likeCount: post.isLiked ? post.likeCount - 1 : post.likeCount + 1,
+      isLiked: !post.isLiked,
+      imagePath: post.imagePath,
+    );
+    await DatabaseHelper().updatePost(newPost);
+    _refreshPosts();
+  }
+
   Widget _buildRichText(String text) {
     List<InlineSpan> spans = [];
-    // スペースで区切って単語ごとにチェック
     final words = text.split(RegExp(r'(\s+)'));
-
     for (var word in words) {
       if (word.startsWith('#')) {
-        // ハッシュタグなら青色
         spans.add(TextSpan(
           text: word,
-          style: const TextStyle(color: Colors.lightBlueAccent, fontWeight: FontWeight.bold),
+          style: const TextStyle(color: Colors.blueAccent, fontWeight: FontWeight.bold),
+          recognizer: TapGestureRecognizer()..onTap = () {
+            showSearch(context: context, delegate: PostSearchDelegate(posts, _buildRichText), query: word);
+          },
         ));
       } else {
-        // 普通の文字なら白
         spans.add(TextSpan(text: word, style: const TextStyle(color: Colors.white)));
       }
     }
-
-    return RichText(
-      text: TextSpan(children: spans, style: const TextStyle(fontSize: 16)),
-    );
-  }
-
-  void _showDeleteAllDialog() {
-    showDialog(
-      context: context,
-      builder: (context) {
-        return AlertDialog(
-          title: const Text('全消去の確認'),
-          content: const Text('すべての投稿を削除しますか？\nこの操作は取り消せません。'),
-          actions: [
-            TextButton(onPressed: () => Navigator.pop(context), child: const Text('キャンセル')),
-            TextButton(
-              onPressed: () {
-                setState(() => posts.clear());
-                _saveData();
-                Navigator.pop(context);
-              },
-              child: const Text('すべて削除', style: TextStyle(color: Colors.redAccent)),
-            ),
-          ],
-        );
-      },
-    );
-  }
-
-  void _showNameEditDialog() {
-    _nameController.text = userName;
-    showDialog(
-      context: context,
-      builder: (context) {
-        return AlertDialog(
-          title: const Text('ユーザー名の変更'),
-          content: TextField(controller: _nameController, decoration: const InputDecoration(hintText: "新しい名前を入力")),
-          actions: [
-            TextButton(onPressed: () => Navigator.pop(context), child: const Text('キャンセル')),
-            ElevatedButton(
-              onPressed: () {
-                setState(() => userName = _nameController.text);
-                _saveData();
-                Navigator.pop(context);
-              },
-              child: const Text('保存'),
-            ),
-          ],
-        );
-      },
-    );
-  }
-
-  void _addNewPost() {
-    if (_controller.text.isEmpty) return;
-    setState(() {
-      String formattedTime = DateFormat('MM/dd HH:mm').format(DateTime.now());
-      posts.insert(0, {
-        'text': _controller.text,
-        'time': formattedTime,
-        'isLiked': false,
-        'likeCount': 0,
-        'author': userName,
-      });
-      _controller.clear();
-    });
-    _saveData();
-    FocusScope.of(context).unfocus();
-  }
-
-  void _toggleLike(int index) {
-    setState(() {
-      posts[index]['isLiked'] = !posts[index]['isLiked'];
-      posts[index]['likeCount'] = posts[index]['isLiked'] 
-          ? posts[index]['likeCount'] + 1 
-          : posts[index]['likeCount'] - 1;
-    });
-    _saveData();
+    return RichText(text: TextSpan(children: spans, style: const TextStyle(fontSize: 16)));
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Column(
-          children: [
-            Text(widget.title, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
-            Text('全 ${posts.length} 件の投稿', style: const TextStyle(fontSize: 12, color: Colors.grey)),
-          ],
-        ),
-        centerTitle: true,
         backgroundColor: const Color(0xFF15202B),
-        leading: IconButton(icon: const Icon(Icons.delete_sweep, color: Colors.redAccent), onPressed: _showDeleteAllDialog),
-        actions: [IconButton(icon: const Icon(Icons.settings), onPressed: _showNameEditDialog)],
+        title: const Text('自分だけの聖域', style: TextStyle(fontWeight: FontWeight.bold)),
+        centerTitle: true,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.search), 
+            onPressed: () => showSearch(context: context, delegate: PostSearchDelegate(posts, _buildRichText))
+          )
+        ],
       ),
       body: Column(
         children: [
@@ -188,58 +324,79 @@ class _MyHomePageState extends State<MyHomePage> {
               itemCount: posts.length,
               itemBuilder: (context, index) {
                 final post = posts[index];
+                final heroTag = 'image_${post.id}'; 
+
                 return Dismissible(
-                  key: UniqueKey(),
-                  direction: DismissDirection.endToStart,
-                  onDismissed: (_) {
-                    setState(() => posts.removeAt(index));
-                    _saveData();
+                  key: Key(post.id.toString()),
+                  confirmDismiss: (direction) async {
+                    final result = await _showDeleteDialog(context);
+                    return result ?? false;
+                  },
+                  onDismissed: (_) async {
+                    if (post.id != null) {
+                      await DatabaseHelper().deletePost(post.id!);
+                      _refreshPosts();
+                    }
                   },
                   background: Container(
-                    color: Colors.redAccent,
-                    alignment: Alignment.centerRight,
-                    padding: const EdgeInsets.only(right: 20),
-                    child: const Icon(Icons.delete_outline, color: Colors.white),
+                    color: Colors.redAccent, 
+                    alignment: Alignment.centerRight, 
+                    padding: const EdgeInsets.only(right: 20), 
+                    child: const Icon(Icons.delete)
                   ),
-                  child: Container(
-                    decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: Colors.white12, width: 0.5))),
-                    child: ListTile(
-                      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                      leading: const CircleAvatar(backgroundColor: Colors.blue, child: Icon(Icons.person, color: Colors.white)),
-                      title: Row(
-                        children: [
-                          Text(post['author'] ?? userName, style: const TextStyle(fontWeight: FontWeight.bold)),
-                          const SizedBox(width: 8),
-                          Text(post['time']!, style: const TextStyle(color: Colors.grey, fontSize: 12)),
-                        ],
-                      ),
-                      // ★ここを _buildRichText に差し替え！
-                      subtitle: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          const SizedBox(height: 4),
-                          _buildRichText(post['text']!), 
-                          const SizedBox(height: 12),
-                          Row(
-                            children: [
-                              InkWell(
-                                onTap: () => _toggleLike(index),
-                                child: Row(
-                                  children: [
-                                    Icon(
-                                      post['isLiked'] ? Icons.favorite : Icons.favorite_border,
-                                      size: 18,
-                                      color: post['isLiked'] ? Colors.pink : Colors.grey,
+                  child: ListTile(
+                    leading: const CircleAvatar(backgroundColor: Colors.blue, child: Icon(Icons.person)),
+                    title: Text("自分   ${post.time}", style: const TextStyle(color: Colors.grey, fontSize: 12)),
+                    subtitle: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        _buildRichText(post.content),
+                        if (post.imagePath != null)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 8.0),
+                            child: GestureDetector(
+                              onTap: () {
+                                Navigator.push(
+                                  context,
+                                  MaterialPageRoute(
+                                    builder: (context) => ImageDetailPage(imagePath: post.imagePath!, tag: heroTag),
+                                  ),
+                                );
+                              },
+                              child: Hero(
+                                tag: heroTag,
+                                child: ClipRRect(
+                                  borderRadius: BorderRadius.circular(12),
+                                  child: ConstrainedBox(
+                                    constraints: const BoxConstraints(maxHeight: 250),
+                                    child: Align(
+                                      alignment: Alignment.centerLeft,
+                                      child: Image.file(
+                                        File(post.imagePath!), 
+                                        fit: BoxFit.contain, 
+                                      ),
                                     ),
-                                    const SizedBox(width: 4),
-                                    Text('${post['likeCount']}', style: const TextStyle(color: Colors.grey)),
-                                  ],
+                                  ),
                                 ),
                               ),
-                            ],
+                            ),
                           ),
-                        ],
-                      ),
+                        const SizedBox(height: 8),
+                        Row(children: [
+                          IconButton(
+                            padding: EdgeInsets.zero,
+                            constraints: const BoxConstraints(),
+                            icon: Icon(
+                              post.isLiked ? Icons.favorite : Icons.favorite_border, 
+                              color: post.isLiked ? Colors.pink : Colors.grey, 
+                              size: 18
+                            ),
+                            onPressed: () => _toggleLike(post),
+                          ),
+                          const SizedBox(width: 4),
+                          Text("${post.likeCount}", style: const TextStyle(color: Colors.grey)),
+                        ]),
+                      ],
                     ),
                   ),
                 );
@@ -248,29 +405,48 @@ class _MyHomePageState extends State<MyHomePage> {
           ),
           Container(
             padding: const EdgeInsets.all(12),
-            decoration: const BoxDecoration(color: Color(0xFF15202B), border: Border(top: BorderSide(color: Colors.white12))),
+            decoration: const BoxDecoration(
+              border: Border(top: BorderSide(color: Colors.white10)),
+            ),
             child: Row(
               children: [
+                IconButton(
+                  icon: Icon(
+                    Icons.image, 
+                    color: _selectedImagePath != null ? Colors.blue : Colors.grey
+                  ),
+                  onPressed: _pickImage,
+                ),
                 Expanded(
                   child: TextField(
-                    controller: _controller,
-                    style: const TextStyle(color: Colors.white),
-                    onSubmitted: (value) => _addNewPost(),
+                    controller: _controller, 
                     decoration: InputDecoration(
-                      hintText: '$userNameとして投稿...',
-                      hintStyle: const TextStyle(color: Colors.grey),
-                      filled: true,
-                      fillColor: Colors.white10,
+                      hintText: "ここだけの本音を...", 
+                      filled: true, 
+                      fillColor: Colors.white10, 
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(30), 
+                        borderSide: BorderSide.none
+                      ),
                       contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-                      border: BorderRadius.circular(30).borderSideNone,
-                    ),
-                  ),
+                    )
+                  )
                 ),
-                const SizedBox(width: 8),
-                FloatingActionButton.small(
-                  onPressed: _addNewPost,
-                  backgroundColor: Colors.blue,
-                  child: const Icon(Icons.send, color: Colors.white),
+                IconButton(
+                  icon: const Icon(Icons.send, color: Colors.blue), 
+                  onPressed: () async {
+                    if (_controller.text.isEmpty && _selectedImagePath == null) return;
+                    await DatabaseHelper().insertPost(
+                      Post(
+                        content: _controller.text, 
+                        time: DateFormat('MM/dd HH:mm').format(DateTime.now()),
+                        imagePath: _selectedImagePath,
+                      )
+                    );
+                    _controller.clear();
+                    setState(() => _selectedImagePath = null);
+                    _refreshPosts();
+                  }
                 ),
               ],
             ),
@@ -279,8 +455,4 @@ class _MyHomePageState extends State<MyHomePage> {
       ),
     );
   }
-}
-
-extension BorderRadiusExtension on BorderRadius {
-  get borderSideNone => OutlineInputBorder(borderRadius: this, borderSide: BorderSide.none);
 }
